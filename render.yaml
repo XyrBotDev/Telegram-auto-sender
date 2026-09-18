@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: telegram-auto-sender
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: SESSION_STRING
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: MESSAGE
+        sync: false
+      - key: INTERVAL
+        value: "300"
+      - key: DELAY_BETWEEN_GROUPS
+        value: "8"
