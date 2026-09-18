@@ -2,7 +2,10 @@ import os
 import json
 import asyncio
 import logging
+import threading
+from flask import Flask
 from pyrogram import Client
+from pyrogram.enums import ChatType
 from pyrogram.errors import (
     FloodWait, PeerFlood, UserBannedInChannel,
     ChatWriteForbidden, ChatAdminRequired,
@@ -16,9 +19,11 @@ API_HASH = os.environ.get("API_HASH", "")
 MESSAGE = os.environ.get("MESSAGE", "Hello! Ye automated message hai. ⚡")
 INTERVAL = int(os.environ.get("INTERVAL", "300"))          # 5 min = 300 sec
 DELAY = int(os.environ.get("DELAY_BETWEEN_GROUPS", "8"))   # Har group ke beech delay
+PORT = int(os.environ.get("PORT", "8080"))                 # Render auto-assign karega
 BLACKLIST_FILE = "blacklist.json"
 # =========================================================
 
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -26,7 +31,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AutoSender")
 
-# Pyrogram Client (Session String se)
+# ---- Flask Server Setup (Render Port Binding ke liye) ----
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return "<h3>✅ Telegram Auto Sender Web Service is Running 24/7!</h3>", 200
+
+@web_app.route("/health")
+def health():
+    return {"status": "ok", "blacklisted_count": len(blacklist)}, 200
+
+def start_flask():
+    logger.info(f"🌐 Starting Flask server on port {PORT}...")
+    web_app.run(host="0.0.0.0", port=PORT)
+
+
+# ---- Pyrogram Client Setup ----
 app = Client(
     name="auto_sender",
     session_string=SESSION_STRING,
@@ -34,7 +55,7 @@ app = Client(
     api_hash=API_HASH
 )
 
-# ---- Blacklist System ----
+# ---- Blacklist Storage System ----
 def load_blacklist() -> set:
     try:
         with open(BLACKLIST_FILE, "r") as f:
@@ -43,11 +64,14 @@ def load_blacklist() -> set:
         return set()
 
 def save_blacklist(bl: set):
-    with open(BLACKLIST_FILE, "w") as f:
-        json.dump(list(bl), f)
+    try:
+        with open(BLACKLIST_FILE, "w") as f:
+            json.dump(list(bl), f)
+    except Exception as e:
+        logger.error(f"Blacklist save error: {e}")
 
 blacklist = load_blacklist()
-sent_messages = {}  # {chat_id: message_id}
+sent_messages = {}  # Format: {chat_id: message_id}
 
 
 # ---- Step 1: Check Deleted Messages ----
@@ -59,7 +83,8 @@ async def check_deleted():
     for chat_id, msg_id in list(sent_messages.items()):
         try:
             msg = await app.get_messages(chat_id, msg_id)
-            if msg.empty:  # Message delete ho chuka hai
+            # Agar message admin ya bot dwara delete ho gaya
+            if not msg or msg.empty:
                 deleted.append(chat_id)
         except Exception:
             deleted.append(chat_id)
@@ -67,32 +92,35 @@ async def check_deleted():
     for chat_id in deleted:
         blacklist.add(chat_id)
         sent_messages.pop(chat_id, None)
-        logger.warning(f"⛔ BLACKLISTED {chat_id} — message deleted by admin/bot")
+        logger.warning(f"⛔ BLACKLISTED {chat_id} — message delete ho chuka tha!")
 
     if deleted:
         save_blacklist(blacklist)
-        logger.info(f"📝 Blacklist updated. Total: {len(blacklist)}")
+        logger.info(f"📝 Blacklist updated! Total blacklisted: {len(blacklist)}")
 
 
-# ---- Step 2: Fetch All Groups (Dynamic) ----
+# ---- Step 2: Dynamic Group Fetching ----
 async def get_all_groups() -> list:
-    """Saare groups ki fresh list (naye groups bhi include honge)"""
+    """Saare joined groups fetch karega (naye groups auto-detect honge)"""
     groups = []
-    async for dialog in app.get_dialogs():
-        chat = dialog.chat
-        if chat.type in ("group", "supergroup"):
-            groups.append(chat.id)
+    try:
+        async for dialog in app.get_dialogs():
+            chat = dialog.chat
+            if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                groups.append(chat.id)
+    except Exception as e:
+        logger.error(f"Error fetching dialogs: {e}")
     return groups
 
 
-# ---- Step 3: Send to All Active Groups ----
+# ---- Step 3: Broadcast Engine ----
 async def send_cycle():
     global blacklist
 
-    # Pehle deleted messages check karo
+    # 1. Pichle deleted msgs check karo
     await check_deleted()
 
-    # Fresh group list lao
+    # 2. Saare active groups nikalo
     all_groups = await get_all_groups()
     active = [g for g in all_groups if g not in blacklist]
 
@@ -112,9 +140,8 @@ async def send_cycle():
             logger.info(f"  ✅ Sent → {chat_id}")
 
         except FloodWait as e:
-            logger.warning(f"  ⏳ FloodWait {e.value}s — waiting...")
+            logger.warning(f"  ⏳ FloodWait mila: {e.value}s ruk rahe hain...")
             await asyncio.sleep(e.value)
-            # Retry this group
             try:
                 msg = await app.send_message(chat_id, MESSAGE)
                 sent_messages[chat_id] = msg.id
@@ -126,38 +153,47 @@ async def send_cycle():
                 UserBannedInChannel, UserNotParticipant,
                 ChannelPrivate, PeerFlood):
             blacklist.add(chat_id)
-            logger.warning(f"  ⛔ BLACKLISTED {chat_id} — no permission")
+            logger.warning(f"  ⛔ BLACKLISTED {chat_id} — permission nahi hai ya ban ho gaye")
 
         except RPCError as e:
-            logger.error(f"  ❌ RPC Error {chat_id}: {e}")
+            logger.error(f"  ❌ RPC Error on {chat_id}: {e}")
             failed += 1
 
         except Exception as e:
-            logger.error(f"  ❌ Error {chat_id}: {e}")
+            logger.error(f"  ❌ Unknown Error on {chat_id}: {e}")
             failed += 1
 
-        # Rate limit se bachne ke liye delay
+        # Har message ke baad safe delay
         await asyncio.sleep(DELAY)
 
     save_blacklist(blacklist)
-    logger.info(f"\n📈 Cycle Complete | ✅ {success} Sent | ❌ {failed} Failed\n")
+    logger.info(f"📈 Cycle Finished | ✅ {success} Sent | ❌ {failed} Failed\n")
 
 
-# ---- Main Loop ----
+# ---- Main Async Worker Loop ----
 async def main():
-    me = await app.get_me()
-    logger.info(f"🔐 Logged in as: {me.first_name} (@{me.username})")
-    logger.info(f"⏱️  Interval: {INTERVAL}s | Delay: {DELAY}s\n")
+    async with app:
+        me = await app.get_me()
+        logger.info(f"🔐 Connected as: {me.first_name} (@{me.username})")
+        logger.info(f"⏱️ Interval: {INTERVAL}s | Delay: {DELAY}s\n")
 
-    while True:
-        try:
-            await send_cycle()
-        except Exception as e:
-            logger.error(f"💥 Critical: {e}")
+        while True:
+            try:
+                await send_cycle()
+            except Exception as e:
+                logger.error(f"💥 Exception in loop: {e}")
 
-        logger.info(f"💤 Sleeping {INTERVAL}s until next cycle...\n")
-        await asyncio.sleep(INTERVAL)
+            logger.info(f"💤 Next cycle in {INTERVAL} seconds...\n")
+            await asyncio.sleep(INTERVAL)
 
 
 if __name__ == "__main__":
-    app.run(main())
+    # 1. Flask server ko background thread me chalayein
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+
+    # 2. Main Pyrogram async engine chalayein
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("👋 Bot stopped.")
